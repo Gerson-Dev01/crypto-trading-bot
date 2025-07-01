@@ -1,165 +1,171 @@
-import pandas as pd
 import numpy as np
-import xgboost as xgb
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from imblearn.over_sampling import SMOTE
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import joblib
+import os
 import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import time
 
-def load_and_preprocess_data():
-    """Carga y normaliza los datos con manejo robusto de valores extremos"""
-    print("🔍 Cargando y normalizando datos...")
-    data = pd.read_csv("data/btc_with_features.csv")
+# Configurar dispositivo (GPU si está disponible)
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Usando dispositivo: {device}")
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, output_size=1):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.dropout = nn.Dropout(0.3)
+        self.fc1 = nn.Linear(hidden_size * 2, 64)  # *2 por bidireccional
+        self.fc2 = nn.Linear(64, 32)
+        self.output = nn.Linear(32, output_size)
     
-    # 1. Limpieza inicial de valores infinitos/nulos
-    data = data.replace([np.inf, -np.inf], np.nan).dropna()
+    def forward(self, x):
+        # Capa LSTM
+        x, _ = self.lstm(x)
+        # Solo tomar el último paso de tiempo
+        x = x[:, -1, :]
+        x = self.dropout(x)
+        # Capas completamente conectadas
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.output(x)
+
+def train_model(processed_data, epochs=100, batch_size=64, learning_rate=0.001):
+    # 1. Preparar datos
+    X_train, y_train = processed_data['train']
+    X_test, y_test = processed_data['test']
     
-    # 2. Identificar columnas numéricas
-    non_features = ['signal', 'future_return', 'Datetime']
-    features = [col for col in data.columns if col not in non_features and data[col].dtype in ['float64', 'int64']]
+    # Convertir a tensores PyTorch
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device)
     
-    # 3. Manejo de valores extremos antes de escalar
-    for col in features:
-        # Calcular percentiles para identificar outliers
-        p1, p99 = np.percentile(data[col].dropna(), [1, 99])
-        data[col] = np.clip(data[col], p1, p99)
+    # Crear DataLoader
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+    
+    # 2. Inicializar modelo
+    model = LSTMModel(input_size=X_train.shape[2]).to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # 3. Entrenamiento
+    best_loss = float('inf')
+    train_history = {'loss': [], 'val_loss': []}
+    
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
         
-        # Rellenar cualquier NaN restante con la mediana
-        median_val = data[col].median()
-        data[col] = data[col].fillna(median_val)
+        for inputs, targets in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        
+        # Pérdida promedio por batch
+        avg_loss = epoch_loss / len(train_loader)
+        train_history['loss'].append(avg_loss)
+        
+        # Validación
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_test_tensor)
+            val_loss = criterion(val_outputs, y_test_tensor).item()
+            train_history['val_loss'].append(val_loss)
+        
+        # Guardar mejor modelo
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save(model.state_dict(), "models/best_model.pth")
+            print(f"Época {epoch+1}: Nuevo mejor modelo - Val Loss: {val_loss:.6f}")
+        
+        print(f"Época {epoch+1}/{epochs} - Loss: {avg_loss:.6f}, Val Loss: {val_loss:.6f}")
+        
+        # Early stopping si no mejora en 10 épocas
+        if epoch > 10 and val_loss > min(train_history['val_loss'][-10:]):
+            print("Early stopping activado")
+            break
     
-    # 4. Normalización robusta
-    scaler = StandardScaler()
-    data[features] = scaler.fit_transform(data[features])
+    # 4. Evaluar con test set
+    model.load_state_dict(torch.load("models/best_model.pth"))
+    model.eval()
+    with torch.no_grad():
+        test_outputs = model(X_test_tensor)
+        test_loss = criterion(test_outputs, y_test_tensor).item()
     
-    print(f"✅ Datos normalizados. Forma final: {data.shape}")
-    return data
+    # Convertir a numpy para métricas
+    y_pred = test_outputs.cpu().numpy().flatten()
+    
+    # Métricas adicionales
+    mse = mean_squared_error(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    
+    print("\n" + "="*50)
+    print("Resultados Finales")
+    print("="*50)
+    print(f"Test Loss (MSE): {test_loss:.6f}")
+    print(f"Mean Squared Error: {mse:.6f}")
+    print(f"Mean Absolute Error: {mae:.6f}")
+    
+    # 5. Guardar recursos finales
+    torch.save(model.state_dict(), "models/final_model.pth")
+    joblib.dump(processed_data['scaler'], "models/scaler.pkl")
+    print("Modelo y escalador guardados en /models")
+    
+    # 6. Visualización de resultados
+    plot_results(train_history, y_test, y_pred)
+    
+    return model, train_history
 
-def prepare_features_labels(data):
-    """Prepara features y balancea clases"""
-    X = data.drop(columns=['signal', 'future_return', 'Datetime'], errors='ignore')
-    y = data['signal']
+def plot_results(history, y_true, y_pred):
+    """Visualiza métricas de entrenamiento y predicciones"""
+    plt.figure(figsize=(15, 10))
     
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y)
+    # Pérdidas de entrenamiento
+    plt.subplot(2, 1, 1)
+    plt.plot(history['loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend()
+    plt.grid(True)
     
-    # Balanceo de clases con SMOTE
-    smote = SMOTE()
-    X_res, y_res = smote.fit_resample(X, y_encoded)
+    # Predicciones vs Reales
+    plt.subplot(2, 1, 2)
+    plt.plot(y_true[:200], label='True Prices', alpha=0.7)
+    plt.plot(y_pred[:200], label='Predicted Prices', alpha=0.7)
+    plt.title('True vs Predicted Prices (First 200 Samples)')
+    plt.ylabel('Price')
+    plt.xlabel('Time Step')
+    plt.legend()
+    plt.grid(True)
     
-    print("\n📊 Distribución de clases después de SMOTE:")
-    print(pd.Series(y_res).value_counts(normalize=True))
-    
-    return X_res, y_res, le
-
-def optimize_model(X_train, y_train):
-    """Optimización de hiperparámetros"""
-    print("\n🔎 Optimizando hiperparámetros...")
-    
-    param_grid = {
-        'learning_rate': [0.01, 0.05],
-        'max_depth': [3, 5],
-        'subsample': [0.8, 1.0],
-        'colsample_bytree': [0.8, 1.0],
-        'gamma': [0, 0.1]
-    }
-    
-    model = xgb.XGBClassifier(
-        objective='multi:softprob',
-        num_class=3,
-        eval_metric=['mlogloss', 'merror'],
-        n_estimators=500,
-        tree_method='hist',
-        early_stopping_rounds=20
-    )
-    
-    grid = GridSearchCV(
-        estimator=model,
-        param_grid=param_grid,
-        cv=3,
-        scoring='f1_weighted',
-        verbose=2
-    )
-    
-    grid.fit(X_train, y_train)
-    return grid.best_estimator_
-
-def train_final_model(X, y, le):
-    """Entrenamiento final con validación"""
-    print("\n🚀 Entrenando modelo optimizado...")
-    
-    # División temporal
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
-    
-    # Modelo optimizado
-    model = optimize_model(X_train, y_train)
-    
-    # Entrenamiento con early stopping
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=100
-    )
-    
-    # Evaluación detallada
-    print("\n📊 Evaluación Final Optimizada:")
-    y_pred = model.predict(X_val)
-    print(classification_report(y_val, y_pred, target_names=["Vender", "Mantener", "Comprar"]))
-    
-    # Visualización
-    plot_confusion_matrix(y_val, y_pred)
-    plot_feature_importance(model, X.columns)
-    
-    return model
-
-def plot_confusion_matrix(y_true, y_pred):
-    """Matriz de confusión interactiva"""
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(8,6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-               xticklabels=["Vender", "Mantener", "Comprar"],
-               yticklabels=["Vender", "Mantener", "Comprar"])
-    plt.title('Matriz de Confusión')
-    plt.show()
-
-def plot_feature_importance(model, feature_names, top_n=20):
-    """Importancia de features mejorada"""
-    importance = model.feature_importances_
-    indices = np.argsort(importance)[-top_n:]
-    
-    plt.figure(figsize=(10,8))
-    plt.barh(range(len(indices)), importance[indices], align='center')
-    plt.yticks(range(len(indices)), [feature_names[i] for i in indices])
-    plt.title(f'Top {top_n} Features más Importantes')
-    plt.xlabel('Importancia Relativa')
     plt.tight_layout()
+    plt.savefig("results/training_results.png")
     plt.show()
-
-def main():
-    try:
-        # 1. Carga y preprocesamiento
-        data = load_and_preprocess_data()
-        
-        # 2. Preparación de features y balanceo
-        X, y, le = prepare_features_labels(data)
-        
-        # 3. Entrenamiento optimizado
-        final_model = train_final_model(X, y, le)
-        
-        # 4. Guardar modelo
-        joblib.dump({'model': final_model, 'label_encoder': le}, 
-                   'models/optimized_trading_model.pkl')
-        
-        print("\n✅ Entrenamiento optimizado completado!")
-        
-    except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
-        raise
 
 if __name__ == "__main__":
-    main()
+    # Cargar datos preprocesados
+    from preprocess_data import preprocess_data
+    
+    print("Cargando y preprocesando datos...")
+    processed_data = preprocess_data('data/btc.csv')
+    
+    print("\nIniciando entrenamiento del modelo...")
+    start_time = time.time()
+    model, history = train_model(processed_data, epochs=100, batch_size=64)
+    print(f"\nEntrenamiento completado en {time.time() - start_time:.2f} segundos")

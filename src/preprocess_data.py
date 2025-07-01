@@ -1,76 +1,102 @@
 import pandas as pd
 import numpy as np
-import os
+import talib as ta
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import TimeSeriesSplit
 
-def procesar_datos():
-    print("\n⚙️ Iniciando preprocesamiento...")
-    
+def preprocess_data(file_path, test_size=0.2, n_splits=5, sequence_length=60):
+    """
+    Preprocesa datos de trading corrigiendo data leakage y añadiendo features avanzados
+    :param file_path: Ruta al archivo CSV con datos históricos
+    :param test_size: Porcentaje de datos para test (0.0-1.0)
+    :param n_splits: Número de splits para validación cruzada temporal
+    :param sequence_length: Longitud de secuencias para LSTM
+    :return: Tuplas con datos de entrenamiento y validación
+    """
+    # 1. Carga de datos con verificación de integridad
     try:
-        # 1. Cargar datos
-        df = pd.read_csv('data/btc.csv')
-        print("Columnas encontradas:", df.columns.tolist())
-        
-        # 2. Verificar y limpiar columna Datetime
-        if 'Datetime' not in df.columns:
-            # Si no existe, intentar con la primera columna
-            df = df.rename(columns={df.columns[0]: 'Datetime'})
-        
-        df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce')
-        df = df.dropna(subset=['Datetime'])
-        
-        # 3. Verificar columnas OHLCV
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        for col in required_cols:
-            if col not in df.columns:
+        data = pd.read_csv(file_path)
+        required_columns = ['timestamp', 'open', 'high', 'low', 'close']
+        for col in required_columns:
+            if col not in data.columns:
                 raise ValueError(f"Columna requerida faltante: {col}")
-            df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # 4. Calcular indicadores
-        df = calcular_indicadores(df)
-        
-        # 5. Guardar
-        df.to_csv('data/btc_preprocessed.csv', index=False)
-        print(f"✅ Preprocesamiento completado: {len(df)} filas guardadas")
-        return True
-        
+        # Verificar datos faltantes
+        if data.isnull().sum().any():
+            print(f"[WARN] {data.isnull().sum().sum()} valores nulos encontrados. Imputando...")
+            data = data.ffill().bfill()
     except Exception as e:
-        print(f"❌ Error crítico: {str(e)}")
-        return False
+        print(f"[ERROR] Fallo al cargar datos: {str(e)}")
+        return None
 
-def calcular_indicadores(df):
-    """Calcula indicadores técnicos"""
-    # 1. Convertir a numérico
-    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    # 2. Feature Engineering Avanzado
+    print("Añadiendo indicadores técnicos...")
+    # Indicadores básicos
+    data['returns'] = np.log(data['close'] / data['close'].shift(1))
+    data['volatility'] = data['returns'].rolling(window=24).std() * np.sqrt(24)  # Volatilidad horaria
     
-    # 2. Ordenar por fecha
-    df = df.sort_values('Datetime')
+    # Osciladores
+    data['rsi'] = ta.RSI(data['close'], timeperiod=14)
+    data['macd'], data['macd_signal'], _ = ta.MACD(data['close'])
+    data['stoch_k'], data['stoch_d'] = ta.STOCH(data['high'], data['low'], data['close'])
     
-    # 3. Indicadores básicos
-    df['log_return'] = np.log(df['Close']/df['Close'].shift(1))
-    df['volatilidad'] = df['log_return'].rolling(24).std()
+    # Tendencia
+    data['ema_12'] = ta.EMA(data['close'], timeperiod=12)
+    data['ema_26'] = ta.EMA(data['close'], timeperiod=26)
+    data['adx'] = ta.ADX(data['high'], data['low'], data['close'], timeperiod=14)
     
-    # 4. Medias móviles
-    for window in [5, 20, 50]:
-        df[f'ma_{window}'] = df['Close'].rolling(window).mean()
+    # Volumen
+    data['volume_ma'] = data['volume'].rolling(window=5).mean()
+    data['obv'] = ta.OBV(data['close'], data['volume'])
     
-    # 5. RSI
-    delta = df['Close'].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    # 3. División temporal ANTES de escalar (evita data leakage)
+    split_idx = int(len(data) * (1 - test_size))
+    train_data = data.iloc[:split_idx]
+    test_data = data.iloc[split_idx:]
     
-    # 6. Eliminar NaNs
-    return df.dropna()
+    # 4. Escalado SEPARADO para train/test
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    
+    # Columnas a escalar (excluyendo volumen y retornos)
+    feature_cols = ['close', 'rsi', 'macd', 'ema_12', 'volatility', 'adx', 'volume_ma', 'obv']
+    
+    # Escalar train
+    train_scaled = scaler.fit_transform(train_data[feature_cols])
+    # Escalar test con parámetros de train (IMPORTANTE!)
+    test_scaled = scaler.transform(test_data[feature_cols])
+    
+    # 5. Crear secuencias temporales para LSTM
+    def create_sequences(data, seq_length):
+        X, y = [], []
+        for i in range(len(data) - seq_length - 1):
+            X.append(data[i:(i + seq_length)])
+            y.append(data[i + seq_length, 0])  # Predecir próximo 'close'
+        return np.array(X), np.array(y)
+    
+    X_train, y_train = create_sequences(train_scaled, sequence_length)
+    X_test, y_test = create_sequences(test_scaled, sequence_length)
+    
+    # 6. Validación cruzada temporal
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    cv_splits = []
+    for train_index, val_index in tscv.split(X_train):
+        cv_splits.append((
+            X_train[train_index], y_train[train_index],
+            X_train[val_index], y_train[val_index]
+        ))
+    
+    print(f"Preprocesamiento completado. Dimensiones:")
+    print(f"Train: {X_train.shape}, Test: {X_test.shape}")
+    print(f"CV splits: {len(cv_splits)}")
+    
+    return {
+        'train': (X_train, y_train),
+        'test': (X_test, y_test),
+        'cv_splits': cv_splits,
+        'scaler': scaler,
+        'feature_cols': feature_cols
+    }
 
+# Ejemplo de uso
 if __name__ == "__main__":
-    if procesar_datos():
-        print("\nVerificación final:")
-        print(pd.read_csv('data/btc_preprocessed.csv').head())
-    else:
-        print("Error en el preprocesamiento. Verifica:")
-        print("1. El archivo data/btc.csv existe")
-        print("2. Tiene columnas: Datetime, Open, High, Low, Close, Volume")
+    processed_data = preprocess_data('data/btc.csv')
