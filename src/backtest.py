@@ -1,61 +1,119 @@
+import numpy as np
 import pandas as pd
-import os
+import joblib
+import torch
+from train_model import LSTMModel
 import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
 
-base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-data_path = os.path.join(base_dir, 'data', 'btc_preprocessed.csv')
+def load_model():
+    """Carga el modelo entrenado y el escalador"""
+    model = LSTMModel(input_size=8)
+    model.load_state_dict(torch.load("models/best_model.pth", map_location=torch.device('cpu')))
+    model.eval()
+    scaler = joblib.load("models/scaler.pkl")
+    return model, scaler
 
-def backtest_cruce_medias():
-    try:
-        print("📊 Cargando datos desde:", data_path)
-        df = pd.read_csv(data_path, parse_dates=['Datetime'], index_col='Datetime')
-        print("✅ Datos cargados. Filas:", len(df))
+def predict_sequence(model, scaler, data):
+    """Predice una secuencia completa de datos"""
+    predictions = []
+    for i in range(60, len(data)):
+        sequence = data[i-60:i]
+        scaled_seq = scaler.transform(sequence)
+        tensor_seq = torch.tensor(scaled_seq, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            pred = model(tensor_seq).item()
+        predictions.append(pred)
+    return predictions
 
-        if 'Close' not in df.columns:
-            raise ValueError("❌ La columna 'Close' no existe en el CSV.")
-        if df['Close'].isnull().all():
-            raise ValueError("❌ La columna 'Close' está completamente vacía.")
-
-        # Calcular medias móviles
-        df['media_corta'] = df['Close'].rolling(window=12).mean()
-        print("✅ Media móvil corta calculada")
-
-        if 'media_movil' not in df.columns:
-            raise ValueError("❌ La columna 'media_movil' no está en el archivo CSV. Asegúrate de que esté incluida.")
-        if df['media_movil'].isnull().all():
-            raise ValueError("❌ La columna 'media_movil' está completamente vacía.")
-
-        df['signal'] = 0
-        df['cruce_positivo'] = (df['media_corta'] > df['media_movil']) & (df['media_corta'].shift(1) <= df['media_movil'].shift(1))
-        df['cruce_negativo'] = (df['media_corta'] < df['media_movil']) & (df['media_corta'].shift(1) >= df['media_movil'].shift(1))
-        df.loc[df['cruce_positivo'], 'signal'] = 1
-        df.loc[df['cruce_negativo'], 'signal'] = -1
-        df.drop(columns=['cruce_positivo', 'cruce_negativo'], inplace=True)
-        print("✅ Señales generadas")
-
-        df['retorno'] = df['Close'].pct_change()
-        df['estrategia'] = df['signal'].shift(1) * df['retorno']
-        df.dropna(subset=['retorno', 'estrategia'], inplace=True)
-        print("✅ Retornos calculados")
-
-        # Graficar resultados
-        plt.figure(figsize=(12,6))
-        plt.plot(df.index, df['retorno'].cumsum(), label='Retorno del activo')
-        plt.plot(df.index, df['estrategia'].cumsum(), label='Estrategia')
-        plt.title('Backtest estrategia cruce de medias')
-        plt.xlabel('Fecha')
-        plt.ylabel('Retorno acumulado')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-        print("✅ Gráfico mostrado")
-
-        rendimiento_total = df['estrategia'].cumsum().iloc[-1]
-        print(f"📈 Rendimiento total de la estrategia: {rendimiento_total:.2%}")
+def backtest_strategy():
+    """Prueba retrospectiva de la estrategia de trading"""
+    # Cargar recursos
+    model, scaler = load_model()
+    data = pd.read_csv("data/btc.csv")
     
-    except Exception as e:
-        print(f"❌ Error durante la ejecución: {e}")
+    # Obtener solo las columnas de características
+    feature_cols = ['close', 'rsi', 'macd', 'ema_12', 'volatility', 'adx', 'volume_ma', 'obv']
+    data = data[feature_cols].dropna()
+    
+    # Predecir todo el conjunto de prueba
+    predictions = predict_sequence(model, scaler, data.values)
+    
+    # Obtener precios reales (desplazados para coincidir con predicciones)
+    actual_prices = data['close'].values[60:]
+    
+    # Simular trading
+    capital = 1000
+    position = 0
+    capital_history = [capital]
+    buy_signals = []
+    sell_signals = []
+    
+    for i in range(len(predictions)):
+        current_price = actual_prices[i]
+        predicted_price = predictions[i]
+        
+        # Estrategia simple
+        if predicted_price > current_price * 1.01:  # Predice subida >1%
+            if position == 0:  # Comprar
+                position = capital / current_price
+                capital = 0
+                buy_signals.append(i)
+        elif predicted_price < current_price * 0.99:  # Predice bajada >1%
+            if position > 0:  # Vender
+                capital = position * current_price
+                position = 0
+                sell_signals.append(i)
+        
+        # Calcular valor actual del portafolio
+        current_value = capital + (position * current_price)
+        capital_history.append(current_value)
+    
+    # Liquidar posición final si queda
+    if position > 0:
+        capital = position * actual_prices[-1]
+        current_value = capital
+    
+    # Métricas de desempeño
+    roi = (current_value / 1000 - 1) * 100
+    sharpe_ratio = (np.mean(capital_history) - 1000) / np.std(capital_history)
+    r2 = r2_score(actual_prices, predictions)
+    
+    print("\nResultados Backtesting:")
+    print(f"Capital inicial: $1000.00")
+    print(f"Capital final: ${current_value:.2f}")
+    print(f"Retorno: {roi:.2f}%")
+    print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
+    print(f"R² Score: {r2:.4f}")
+    
+    # Visualizar resultados
+    plt.figure(figsize=(15, 10))
+    
+    # Precios y predicciones
+    plt.subplot(2, 1, 1)
+    plt.plot(actual_prices, label='Precio Real', alpha=0.7)
+    plt.plot(predictions, label='Predicciones', alpha=0.7)
+    plt.scatter(buy_signals, actual_prices[buy_signals], marker='^', color='g', label='Compras')
+    plt.scatter(sell_signals, actual_prices[sell_signals], marker='v', color='r', label='Ventas')
+    plt.title('Precios vs Predicciones')
+    plt.ylabel('Precio')
+    plt.legend()
+    plt.grid(True)
+    
+    # Evolución del capital
+    plt.subplot(2, 1, 2)
+    plt.plot(capital_history, label='Capital')
+    plt.title('Evolución del Capital')
+    plt.ylabel('Valor ($)')
+    plt.xlabel('Paso de tiempo')
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig("results/backtest_results.png")
+    plt.close()
+    print("Resultados de backtest guardados en results/backtest_results.png")
+    
+    return current_value
 
 if __name__ == "__main__":
-    backtest_cruce_medias()
+    final_capital = backtest_strategy()
