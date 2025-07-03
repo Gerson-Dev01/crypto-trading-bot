@@ -205,10 +205,21 @@ def preprocess_data(file_path, test_size=0.2, n_splits=5, sequence_length=60):
     except Exception as e:
         logging.error(f"Error en CV: {str(e)}")
         cv_splits = []
+    
+    feature_cols = ['close', 'rsi', 'macd', 'ema_12', 'volatility', 'adx', 'volume_ma', 'obv']
+    data = data[['timestamp'] + feature_cols]  # Orden explícito
+
+    processed_file_path = 'data/btc_processed.csv'
+    #data.reset_index(inplace=True)  # Convertir el índice a columna
+    data.reset_index(drop=True)
+    data.to_csv(processed_file_path, index=False)
+    logging.info(f"Datos preprocesados guardados en {processed_file_path}")
 
     logging.info(f"Preprocesamiento completado. Dimensiones:")
     logging.info(f"Train: {X_train.shape}, Test: {X_test.shape}")
     logging.info(f"CV splits: {len(cv_splits)}")
+
+    
     
     return {
         'train': (X_train, y_train),

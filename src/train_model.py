@@ -157,6 +157,7 @@ def train_model(processed_data, epochs=100, batch_size=64, learning_rate=0.001):
     # 6. Visualización de resultados
     plot_results(train_history, y_test, y_pred)
     
+    verify_predictions(model, X_test_tensor, y_test_tensor)
     return model, train_history
 
 def plot_results(history, y_true, y_pred):
@@ -189,6 +190,18 @@ def plot_results(history, y_true, y_pred):
     plt.close()
     logging.info("Resultados de entrenamiento guardados en results/training_results.png")
 
+def verify_predictions(model, X_test, y_test):
+    """Verifica que las predicciones sean lógicas"""
+    with torch.no_grad():
+        sample = X_test[:1]  # Primera muestra
+        prediction = model(sample).item()
+    
+    print("\nVerificación de predicción:")
+    print(f"Input shape: {sample.shape}")
+    print(f"Predicción: {prediction:.4f}")
+    print(f"Valor real: {y_test[0].item():.4f}")
+    print(f"Diferencia: {abs(prediction - y_test[0].item()):.4f}")
+
 if __name__ == "__main__":
     # Cargar datos preprocesados
     from preprocess_data import preprocess_data
@@ -203,4 +216,5 @@ if __name__ == "__main__":
     logging.info("\nIniciando entrenamiento del modelo...")
     start_time = time.time()
     model, history = train_model(processed_data, epochs=100, batch_size=64)
+    
     logging.info(f"\nEntrenamiento completado en {time.time() - start_time:.2f} segundos")
